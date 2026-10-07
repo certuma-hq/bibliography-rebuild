@@ -1,0 +1,7 @@
+# Data and outputs: company data, never committed
+*.json
+*.csv
+*.html
+
+# Python cache
+__pycache__/
