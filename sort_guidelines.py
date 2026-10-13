@@ -37,6 +37,9 @@ GUIDELINE_ORG_KEYWORDS = {
     "AACE", "USPSTF", "WHO", "CDC", "ACP", "ATS", "ASCO", "NCCN",
 }
 
+# CHANGED: bibliography "type" values that count as a guideline
+GUIDELINE_TYPE_LABELS = {"guideline", "clinical-guideline"}
+
 # Fallback evidence cascade: only moves to next tier when current one turns up
 # zero candidates for a given guideline/specialty
 # Stops at case reports as tiers below that are considered low-quality evidence
@@ -44,7 +47,8 @@ GUIDELINE_ORG_KEYWORDS = {
 # last resort (e.g., editorials, letters, preprints, narrative reviews)
 # Uses inferred Oxford level of evidence estimates rather than the combined rank field
 # (see check_existence.py for details) since the rank field bundles guideline/retraction
-# status together with low-quality and unrated evidence into the same scale
+# status together with low-quality and unrated evidence into the same scale and is used
+# more for sorting types of evidence than using for actual quality ranking
 EVIDENCE_CASCADE_TIERS = [
     {"1a", "1b"},
     {"2a", "2b"},
@@ -119,6 +123,20 @@ def is_guideline_reference(entry):
     # PubMed's pubtype tag is missing/incomplete
     # Currently have not implemented a way to pull in orgs but the logic is there for
     # when we do
+    if entry.get("_is_guideline"):
+        return True
+    # CHANGED: also trust the bibliography's own type label as a second signal, so
+    # guidelines with only a DOI or URL (no PubMed pubtypes) aren't missed.
+    # Less reliable than PubMed's tag
+    if (entry.get("type") or "").lower() in GUIDELINE_TYPE_LABELS:
+        return True
+    return confirmed_by_pubmed(entry)
+
+
+def confirmed_by_pubmed(entry):
+    # CHANGED: True if PubMed data (pubtype tag or corporate author) says this is a guideline,
+    # as opposed to only the bibliography's own type label
+    # Only PubMed-confirmed guidelines are approved automatically
     if entry.get("_is_guideline"):
         return True
     corp_author = (entry.get("_pubmed_corporate_author") or "").upper()
@@ -454,6 +472,7 @@ def main():
             fallback_by_specialty[specialty].append(e)
 
     approved = []
+    label_only_count = 0  # CHANGED: current guidelines sent to review because only the type label says guideline
     review_rows = list(fda_review_rows)
     specialties_with_no_guideline = []
 
@@ -506,7 +525,17 @@ def main():
 
             age = current_year - newest.get("year")
 
-            if age <= threshold:
+            # CHANGED: a current guideline is only approved automatically if PubMed confirms it's
+            # a guideline. If only the bibliography's type label says so, it goes to review instead
+            if age <= threshold and not confirmed_by_pubmed(newest):
+                review_rows.append({
+                    "id": newest.get("id"), "title": newest.get("title"), "year": newest.get("year"),
+                    "specialty": specialty, "evidence_level": newest.get("_oxford_level_of_evidence_estimate"),
+                    "reason": "guideline_label_only: labeled guideline in bibliography only, confirm",
+                    "evidence_tier": "", "title_relevance_score": "", "decision": "",
+                })
+                label_only_count += 1
+            elif age <= threshold:
                 # ---- Step 6: approved ----
                 approved.append(newest)
             else:
@@ -568,6 +597,7 @@ def main():
     print("=" * 50)
     print(f"Guideline candidates evaluated: {len(guideline_candidates)}")
     print(f"Approved (current): {len(approved)}")
+    print(f"Current but labeled guideline in bibliography only (sent to review): {label_only_count}")  # CHANGED
     print(f"Specialties with zero guideline coverage: {len(specialties_with_no_guideline)}")
     if specialties_with_no_guideline:
         print(f"  {', '.join(specialties_with_no_guideline)}")
