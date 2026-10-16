@@ -37,24 +37,12 @@ GUIDELINE_ORG_KEYWORDS = {
     "AACE", "USPSTF", "WHO", "CDC", "ACP", "ATS", "ASCO", "NCCN",
 }
 
-# CHANGED: bibliography "type" values that count as a guideline
+# bibliography "type" values that count as a guideline
 GUIDELINE_TYPE_LABELS = {"guideline", "clinical-guideline"}
 
-# Fallback evidence cascade: only moves to next tier when current one turns up
-# zero candidates for a given guideline/specialty
-# Stops at case reports as tiers below that are considered low-quality evidence
-# and are in fact not considered original research at all--not even suggested as a
-# last resort (e.g., editorials, letters, preprints, narrative reviews)
-# Uses inferred Oxford level of evidence estimates rather than the combined rank field
-# (see check_existence.py for details) since the rank field bundles guideline/retraction
-# status together with low-quality and unrated evidence into the same scale and is used
-# more for sorting types of evidence than using for actual quality ranking
-EVIDENCE_CASCADE_TIERS = [
-    {"1a", "1b"},
-    {"2a", "2b"},
-    {"4"},
-]
-ALL_CASCADE_LEVELS = {lvl for tier in EVIDENCE_CASCADE_TIERS for lvl in tier}
+# CHANGED: removed the fallback evidence cascade (EVIDENCE_CASCADE_TIERS) that suggested
+# non-guideline studies as replacements for out-of-date guidelines. Suggestions were rarely
+# on topic, and only guidelines and FDA documents are wanted in the output
 
 # Fields check_existence.py adds on top of original bibliography schema
 # Stripped back out before writing clean, re-uploadable output files
@@ -74,7 +62,7 @@ CERT_PREFIX_RE = re.compile(r"^(CERT-[A-Z0-9]+)")
 
 # ========== FDA TRACK CONFIG ==========
 # FDA documents (labels, safety communications, REMS) skip guideline/specialty logic
-# since they aren't research; they are excluded from the fallback evidence cascade
+# since they aren't research
 # They track a drug rather than a specialty
 
 # Only frozen FDA label PDFs (accessdata.fda.gov .../label/YYYY/...) get a year cutoff since they do not update on their own like DailyMed
@@ -125,7 +113,7 @@ def is_guideline_reference(entry):
     # when we do
     if entry.get("_is_guideline"):
         return True
-    # CHANGED: also trust the bibliography's own type label as a second signal, so
+    # Also trust the bibliography's own type label as a second signal, so
     # guidelines with only a DOI or URL (no PubMed pubtypes) aren't missed.
     # Less reliable than PubMed's tag
     if (entry.get("type") or "").lower() in GUIDELINE_TYPE_LABELS:
@@ -133,8 +121,20 @@ def is_guideline_reference(entry):
     return confirmed_by_pubmed(entry)
 
 
+# CHANGED: PubMed publication types that contradict a bibliography "guideline" label
+TRIAL_PUBTYPES = {"Randomized Controlled Trial"}
+
+
+def label_conflicts_with_pubmed(entry):
+    # CHANGED: True if only the bibliography's label says guideline while PubMed says it's a
+    # randomized trial. Usually means the wrong document is attached (e.g., an id naming a
+    # guideline but pointing to a trial), so these go to review with their own reason
+    # instead of being treated as guidelines
+    return not confirmed_by_pubmed(entry) and bool(TRIAL_PUBTYPES & set(entry.get("_pubmed_pubtypes") or []))
+
+
 def confirmed_by_pubmed(entry):
-    # CHANGED: True if PubMed data (pubtype tag or corporate author) says this is a guideline,
+    # True if PubMed data (pubtype tag or corporate author) says this is a guideline,
     # as opposed to only the bibliography's own type label
     # Only PubMed-confirmed guidelines are approved automatically
     if entry.get("_is_guideline"):
@@ -240,54 +240,8 @@ def title_keywords(title):
     return {t for t in tokens if t not in TITLE_STOPWORDS and not t.isdigit() and len(t) > 2}
 
 
-def title_relevance_score(title_a, title_b):
-    # Answers the question: how similar are the two titles in terms of meaningful keywords?
-    # Used for fallback search when comparing aged-out guideline titles to potential replacements
-    # Purposefully looser comparison than titles_match() above as chances that guidelines and fallback
-    # candidates such as meta-analyses or reviews may not share exact wording with the guideline itself
-    # titles_match() focuses on near-exact matches of the full title text, whereas
-    # This function instead measures overlap of meaningful keywords, ignoring common boilerplate words
-    words_a, words_b = title_keywords(title_a), title_keywords(title_b)
-    if not words_a or not words_b:
-        return 0.0
-    overlap = words_a & words_b
-    # Overlap coefficient: divides by the SMALLER keyword set rather than
-    # the union, so a short, focused meta-analysis title isn't penalized for being
-    # shorter than a verbose guideline title -- what matters is whether most of the
-    # shorter title's distinctive words show up in the longer one.
-    
-    # Divide by the size of the smaller keyword set to get the overlap coefficient (between 0 and 1)
-    # This accounts for the fact that one title may be much shorter than the other
-    # and avoids penalizing shorter titles that are otherwise highly relevant
-    # as what matters is whether most of the shorter title's distinctive words appear in the longer title
-    return round(len(overlap) / min(len(words_a), len(words_b)), 3)
-
-
-def cascading_fallback_search(pool, anchor_title=None):
-    # Tries each evidence tier in order (1a/1b, then 2a/2b, then 4), stopping at the
-    # first tier that has ANY match. anchor_title is the aged-out guideline's title for
-    # a targeted search (case 1); omitted for a broad, no-anchor search (case 2), which
-    # just sorts each tier by year instead of by title relevance.
-    # Returns (tier_label, [(score_or_None, entry), ...]) -- tier_label is None if
-    # nothing was found at any tier.
-
-    # Designed for situations in which guideline version has aged out or no guideline available for a specialty group
-    # Iterates through evidence tiers in order, attempting to find matches within each tier before moving to the next
-    # Returns the first tier with any matches, along with the scored entries within that tier
-    # Returns None if no matches are found in any tier
-    for tier in EVIDENCE_CASCADE_TIERS:
-        tier_pool = [e for e in pool if e.get("_oxford_level_of_evidence_estimate") in tier]
-        if not tier_pool:
-            continue
-        if anchor_title:
-            scored = [(title_relevance_score(anchor_title, c.get("title")), c) for c in tier_pool]
-            scored = [pair for pair in scored if pair[0] > 0]
-            scored.sort(key=lambda pair: pair[0], reverse=True)
-        else:
-            scored = [(None, c) for c in sorted(tier_pool, key=lambda e: e.get("year") or 0, reverse=True)]
-        if scored:
-            return "/".join(sorted(tier)), scored
-    return None, []
+# CHANGED: removed title_relevance_score() and cascading_fallback_search(), which scored
+# and suggested non-guideline studies as replacements; they're no longer used
 
 
 def clean_entry(entry):
@@ -426,8 +380,8 @@ def main():
         else:
             fda_review_rows.append({
                 "id": e.get("id"), "title": e.get("title"), "year": e.get("year"),
-                "specialty": "", "evidence_level": "", "evidence_tier": "",
-                "reason": reason, "title_relevance_score": "", "decision": "",
+                "specialty": "", "evidence_level": "",
+                "reason": reason, "decision": "",  # CHANGED: suggestion columns removed
                 "category": category,
             })
 
@@ -439,40 +393,26 @@ def main():
 
     # ---- Step 1: guideline candidate pool ----
     guideline_candidates = [e for e in entries if is_guideline_reference(e) and not e.get("_pubmed_integrity_flags")]
-    # Includes every tier the cascade might need (1a through 4) -- which specific tier
-    # actually gets used is decided per-search in cascading_fallback_search()
-
-    # Builds pool of non-guidelines for fallback
-    # Only contains valid, non-retracted, non-guideline entries
-    # with a valid evidence rating estimate
-    # Does not include entries that are marked as low-quality
-    # since these types of entries are not suggested for inclusion in the fallback pool
-    non_guideline_pool = [
-        e for e in entries
-        if not is_guideline_reference(e)
-        and not e.get("_pubmed_integrity_flags")
-        and e.get("_oxford_level_of_evidence_estimate") in ALL_CASCADE_LEVELS
-    ]
+    # CHANGED: removed the non-guideline pool that fed the fallback suggestions
 
     # ---- Step 3: group guideline candidates by specialty ----
     by_specialty = defaultdict(list)
     unspecified = []
+    label_conflicts = []  # CHANGED: labeled guideline but PubMed says randomized trial
     for e in guideline_candidates:
+        # CHANGED: kept out of the guideline families, so a trial can't be picked as a
+        # family's newest edition or approved; reviewed separately below
+        if label_conflicts_with_pubmed(e):
+            label_conflicts.append(e)
+            continue
         specialty = pick_primary_specialty(e)
         if specialty is None:
             unspecified.append(e)
         else:
             by_specialty[specialty].append(e)
 
-    # Same grouping applied to the non-guideline fallback pool, reused in steps 7/8
-    fallback_by_specialty = defaultdict(list)
-    for e in non_guideline_pool:
-        specialty = pick_primary_specialty(e)
-        if specialty is not None:
-            fallback_by_specialty[specialty].append(e)
-
     approved = []
-    label_only_count = 0  # CHANGED: current guidelines sent to review because only the type label says guideline
+    label_only_count = 0  # Current guidelines sent to review because only the type label says guideline
     review_rows = list(fda_review_rows)
     specialties_with_no_guideline = []
 
@@ -487,23 +427,13 @@ def main():
 
         if not candidates:
             # ---- Step 8: no guideline at all for this specialty ----
-            # For references that are not guidelines, finds next-best level of evidence,
-            # newest first (no topic filtering as with guidelines)
+            # CHANGED: one review row for the specialty, instead of suggesting non-guideline studies
             specialties_with_no_guideline.append(specialty) # Record specialty with no guideline for display on console
-            tier_label, scored = cascading_fallback_search(fallback_by_specialty.get(specialty, []))
-            if not scored: # If no reference found in any fallback tier, record as such in the review rows
-                review_rows.append({
-                    "id": "", "title": "", "year": "", "specialty": specialty, "evidence_level": "",
-                    "reason": "no_guideline_for_specialty", "evidence_tier": "none_found",
-                    "title_relevance_score": "", "decision": "",
-                })
-            for score, e in scored: # Adds below rows for each scored reference
-                review_rows.append({
-                    "id": e.get("id"), "title": e.get("title"), "year": e.get("year"),
-                    "specialty": specialty, "evidence_level": e.get("_oxford_level_of_evidence_estimate"),
-                    "reason": "no_guideline_for_specialty", "evidence_tier": tier_label,
-                    "title_relevance_score": "", "decision": "",
-                })
+            review_rows.append({
+                "id": "", "title": "", "year": "", "specialty": specialty, "evidence_level": "",
+                "reason": "no_guideline_for_specialty: find a guideline, or confirm none is needed",
+                "decision": "",
+            })
             continue
 
         # ---- Steps 4-5: title-cluster within specialty, take most recent per cluster ----
@@ -519,45 +449,48 @@ def main():
                     "id": newest.get("id"), "title": newest.get("title"), "year": "",
                     "specialty": specialty, "evidence_level": "",
                     "reason": "guideline_no_year: no year recorded, check how current this is",
-                    "evidence_tier": "", "title_relevance_score": "", "decision": "",
+                    "decision": "",  # CHANGED: suggestion columns removed
                 })
                 continue
 
             age = current_year - newest.get("year")
 
-            # CHANGED: a current guideline is only approved automatically if PubMed confirms it's
+            # A current guideline is only approved automatically if PubMed confirms it's
             # a guideline. If only the bibliography's type label says so, it goes to review instead
             if age <= threshold and not confirmed_by_pubmed(newest):
                 review_rows.append({
                     "id": newest.get("id"), "title": newest.get("title"), "year": newest.get("year"),
                     "specialty": specialty, "evidence_level": newest.get("_oxford_level_of_evidence_estimate"),
                     "reason": "guideline_label_only: labeled guideline in bibliography only, confirm",
-                    "evidence_tier": "", "title_relevance_score": "", "decision": "",
+                    "decision": "",  # CHANGED: suggestion columns removed
                 })
                 label_only_count += 1
             elif age <= threshold:
                 # ---- Step 6: approved ----
                 approved.append(newest)
             else:
-                # ---- Step 7: aged out -- targeted fallback search, cascading through
-                # evidence tiers only if the ideal one (1a/1b) turns up nothing ----
-                tier_label, scored = cascading_fallback_search(
-                    fallback_by_specialty.get(specialty, []), anchor_title=newest.get("title")
-                )
-                reason = f"guideline_aged_out ({newest.get('id')}, {newest.get('year')})"
-                if not scored:
-                    review_rows.append({
-                        "id": "", "title": "", "year": "", "specialty": specialty, "evidence_level": "",
-                        "reason": reason, "evidence_tier": "none_found",
-                        "title_relevance_score": "", "decision": "",
-                    })
-                for score, c in scored:
-                    review_rows.append({
-                        "id": c.get("id"), "title": c.get("title"), "year": c.get("year"),
-                        "specialty": specialty, "evidence_level": c.get("_oxford_level_of_evidence_estimate"),
-                        "reason": reason, "evidence_tier": tier_label,
-                        "title_relevance_score": score, "decision": "",
-                    })
+                # ---- Step 7: aged out ----
+                # CHANGED: one review row for the out-of-date guideline itself, instead of rows
+                # suggesting non-guideline studies. The reviewer keeps it (still the latest
+                # edition), replaces it (newer guideline added to the bibliography), or rejects it
+                review_rows.append({
+                    "id": newest.get("id"), "title": newest.get("title"), "year": newest.get("year"),
+                    "specialty": specialty, "evidence_level": newest.get("_oxford_level_of_evidence_estimate"),
+                    "reason": f"guideline_aged_out: {age} years old (limit {threshold}), keep if still the latest edition",
+                    "decision": "",
+                })
+
+    # CHANGED: labeled guideline in the bibliography but PubMed says randomized trial --
+    # never approved; one review row each so the reviewer can check for a wrong attached document
+    for e in label_conflicts:
+        review_rows.append({
+            "id": e.get("id"), "title": e.get("title"), "year": e.get("year"),
+            "specialty": pick_primary_specialty(e) or "UNSPECIFIED",
+            "evidence_level": e.get("_oxford_level_of_evidence_estimate"),
+            "reason": ("guideline_label_conflict: bibliography says guideline but PubMed says "
+                       "randomized trial; check whether the wrong document is attached"),
+            "decision": "",
+        })
 
     # Entries with no identifiable specialty at all -- can't apply a specialty-specific
     # currency rule, so route straight to manual review rather than guessing.
@@ -565,8 +498,8 @@ def main():
         review_rows.append({
             "id": e.get("id"), "title": e.get("title"), "year": e.get("year"),
             "specialty": "UNSPECIFIED", "evidence_level": e.get("_oxford_level_of_evidence_estimate"),
-            "reason": "no_specialty_identified", "evidence_tier": "",
-            "title_relevance_score": "", "decision": "",
+            "reason": "no_specialty_identified",
+            "decision": "",  # CHANGED: suggestion columns removed
         })
 
     # ---- Write clean, upload-ready output ----
@@ -574,16 +507,14 @@ def main():
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump({"schema_version": data.get("schema_version", 1), "citations": clean_output}, f, indent=2, ensure_ascii=False)
 
-    # Rows are grouped by specialty and reason, so each out-of-date guideline's
-    # candidates sit together
-    # Python's sort keeps the existing order within a group, which is
-    # already best score first (targeted search) or newest first (broad search), so a reviewer
-    # deciding "what replaces this guideline" sees its strongest candidates at the top
-    review_rows.sort(key=lambda r: (r["specialty"], r["reason"]))
+    # CHANGED: rows grouped by specialty, then by type of reason (aged out, label only, etc.),
+    # then by id, so each specialty's rows sit together and the order is the same every run
+    review_rows.sort(key=lambda r: (r["specialty"], r["reason"].split(":")[0], r["id"] or ""))
 
     # ---- Write manual-review spreadsheet ----
     with open(args.review_output, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["id", "title", "year", "specialty", "evidence_level", "evidence_tier", "reason", "title_relevance_score", "decision", "category"])
+        # CHANGED: removed the evidence_tier and title_relevance_score columns (suggestions only)
+        writer = csv.DictWriter(f, fieldnames=["id", "title", "year", "specialty", "evidence_level", "reason", "decision", "category"])
         writer.writeheader()
         writer.writerows(review_rows)
 
@@ -597,12 +528,13 @@ def main():
     print("=" * 50)
     print(f"Guideline candidates evaluated: {len(guideline_candidates)}")
     print(f"Approved (current): {len(approved)}")
-    print(f"Current but labeled guideline in bibliography only (sent to review): {label_only_count}")  # CHANGED
+    print(f"Current but labeled guideline in bibliography only (sent to review): {label_only_count}")
+    print(f"Labeled guideline but PubMed says randomized trial (sent to review): {len(label_conflicts)}")  # CHANGED
     print(f"Specialties with zero guideline coverage: {len(specialties_with_no_guideline)}")
     if specialties_with_no_guideline:
         print(f"  {', '.join(specialties_with_no_guideline)}")
     print(f"Entries with no identifiable specialty: {len(unspecified)}")
-    print(f"Manual-review candidates (guideline fallback + FDA): {len(review_rows)}")
+    print(f"Manual-review candidates (guidelines + FDA): {len(review_rows)}")  # CHANGED: no fallback suggestions
     print()
     by_category = Counter(category for _, category in fda_entries)
     print(f"FDA track: {len(fda_entries)} entries ({', '.join(f'{c}: {n}' for c, n in sorted(by_category.items()))})")
@@ -623,3 +555,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
