@@ -1,4 +1,6 @@
 import argparse
+import csv  # CHANGED: for the audit CSV
+import hashlib  # CHANGED: for the per-row hash in the audit CSV
 import json
 import re
 import sys  # CHANGED: needed for sys.exit(1) in the clean --input error handling below
@@ -440,7 +442,7 @@ def _title_words(title):
 
 
 def titles_match(title_a, title_b, similarity_threshold=0.85, min_containment_len=12, min_words_for_reorder=4):
-    # Return True if lowercased/stripped titles close enough to be the same work
+    # Return True if lowercased/stripped titles close enough to be the same word
     # Note: given that some titles are truncated in CrossRef, accept a match when
     # the shorter title is a clean substring of the longer one as well
     if not title_a or not title_b:
@@ -451,7 +453,7 @@ def titles_match(title_a, title_b, similarity_threshold=0.85, min_containment_le
     shorter, longer = sorted((title_a.rstrip("."), title_b.rstrip(".")), key=len)
     if len(shorter) >= min_containment_len and shorter in longer:
         return True
-    # CHANGED: also accept titles made of exactly the same words in a different order.
+    # Accepts titles made of exactly the same words in a different order
     # PubMed and CrossRef sometimes reorder a title, e.g. "Treatment of X: ACOG Guideline No. 5"
     # vs "ACOG Guideline No. 5: Treatment of X". Character similarity drops below the bar when a
     # chunk moves, which produced a false PMID/DOI mismatch. Requires the SAME set of words (not
@@ -566,7 +568,7 @@ def resolve_entry_verdict(entry, ids_present, cache):
             # NOT missing since the entry may be valid but just was not able to be checked due to
             # network issues, API downtime, etc
             # To be manually checked later
-            statuses.append((id_type, id_value, "UNVERIFIED", None))  # CHANGED: "id_value" had gotten split across two lines (syntax error), rejoined onto one line
+            statuses.append((id_type, id_value, "UNVERIFIED", None))
         elif not cached.get("exists"): # If record in cache but cache "exists" field
             # is False, mark as hallucinated (the id resolves to nothing)
             statuses.append((id_type, id_value, "hallucinated", cached))
@@ -598,14 +600,13 @@ def resolve_entry_verdict(entry, ids_present, cache):
                 # but their titles do not match, return "invalid_pmid_doi_mismatch"
                 return "invalid_pmid_doi_mismatch"
 
-    # Compare the entry's own claimed title/authors/year against whichever source has metadata
     reference_record = titled[0] if titled else None
-    # titled[0] is PMID by design of ids_present sorting it to the position where index 0 
-    # would be (see main()) even if DOI and url are also present
-    # The assumption is that if either of the identifiers PMID or DOI are invalid_hallucinated due to
-    # a mismatch between the entry's metadata and the API's metadata, the entire record should be flagged as invalid_hallucinated
-    # Reference_record is only ever ONE record (titled[0]) - this check never looks at "any"
-    # identifier collectively, just compares the entry's own claim against that one record
+    # Compares entry's own claimed title/authors/year against one source record:
+    # PubMed record if the entry has a PMID (ids_present lists PMID first, see main())
+    # otherwise the DOI. URL records have no title, so they're no used here
+    # If the claim doesn't match that record, the whole entry is invalid_hallucinated
+    # Disagreement between a PMID and a DOI is caught separately by the cross-title check above
+    # None (no titled record, e.g., url only) -> compare_metadata returns "inconclusive" -> stays valid
 
     comparison = compare_metadata(entry.get("title"), entry.get("authors"), entry.get("year"), reference_record)
     if comparison == "mismatch":
@@ -725,14 +726,123 @@ def load_previous_verdicts(output_path):
     return previous
 
 
+# CHANGED: audit CSV -- a readable, one-row-per-reference record of this run's results for
+# review and MD/CTO sign-off. Not read by any script; sort_guidelines.py still reads the JSON
+
+# Plain-language reason for each excluded verdict
+EXCLUDED_REASONS = {
+    "invalid_no_id": "no PMID, DOI, or URL to check",
+    "invalid_hallucinated": "identifier points to no record (reference may not exist)",
+    "invalid_pmid_doi_mismatch": "PMID and DOI point to different papers",
+    "UNVERIFIED": "could not be checked (lookup failed or site blocked); retried next run",
+}
+RETRACTION_PUBTYPES = {"Retracted Publication", "Retraction Notice"}
+# No Tier 2 (claim-support) column: claims will be matched to references in a separate process
+ID_YEAR_RE = re.compile(r"(?<!\d)(19[5-9]\d|20[0-2]\d)(?!\d)")  # a 4-digit year 1950-2029 in an id
+
+AUDIT_CSV_COLUMNS = [
+    "id", "title", "year", "ids_checked",
+    "tier1_verdict", "evidence_type", "evidence_level",
+    "excluded", "excluded_reason", "changed", "changed_from_to", "retracted_withdrawn",
+    "flagged_for_manual_review", "manual_review_reasons", "abstract",
+    "run_id", "row_hash", "md_cto_signoff_name", "md_cto_signoff_date",
+]
+# Columns left out of the row hash: the hash itself, and the sign-off columns filled in by hand afterward
+UNHASHED_COLUMNS = {"row_hash", "md_cto_signoff_name", "md_cto_signoff_date"}
+
+
+def id_year_mismatch(entry):
+    # Returns the year in the id if it differs from the entry's year by more than 1 (e.g. IDSA2024cUTI
+    # attached to a 2011 document), else None. The id names what the protocol author meant to cite,
+    # so a big gap often means an older edition or the wrong document is attached
+    id_years = ID_YEAR_RE.findall(str(entry.get("id") or ""))
+    year = entry.get("year")
+    if len(id_years) != 1 or not isinstance(year, int):
+        return None
+    id_year = int(id_years[0])
+    return id_year if abs(id_year - year) > 1 else None
+
+
+def audit_row(entry, run_id, has_previous_run):
+    verdict = entry.get("_tier1_existence")
+    integrity_flags = entry.get("_pubmed_integrity_flags") or []
+    previous = entry.get("_tier1_previous_existence")
+    changed = bool(entry.get("_tier1_existence_changed"))
+
+    # Excluded = what sort_guidelines.py drops before sorting: any non-valid verdict, or a
+    # retraction/integrity notice even when the verdict is valid
+    excluded_reason = EXCLUDED_REASONS.get(verdict, "")
+    if verdict == "valid" and integrity_flags:
+        excluded_reason = "PubMed integrity notice: " + ", ".join(integrity_flags)
+
+    # Flagged = a person should look at it this run
+    review_reasons = []
+    if verdict == "UNVERIFIED":
+        review_reasons.append("could not be verified")
+    if verdict == "invalid_pmid_doi_mismatch":
+        review_reasons.append("PMID/DOI mismatch")
+    if integrity_flags:
+        review_reasons.append("integrity notice: " + ", ".join(integrity_flags))
+    if changed:
+        review_reasons.append(f"verdict changed since last run ({previous} -> {verdict})")
+    mismatch_year = id_year_mismatch(entry)
+    if mismatch_year:
+        review_reasons.append(f"id says {mismatch_year} but document is {entry.get('year')} (possible wrong or older document)")
+
+    if changed:
+        changed_from_to = f"{previous} -> {verdict}"
+    elif not has_previous_run or previous is None:
+        changed_from_to = "no previous run to compare"
+    else:
+        changed_from_to = ""
+
+    row = {
+        "id": entry.get("id") or "",
+        "title": entry.get("title") or "",
+        "year": entry.get("year") or "",
+        "ids_checked": ", ".join(entry.get("_tier1_ids_checked") or []),
+        "tier1_verdict": verdict or "",
+        "evidence_type": entry.get("_evidence_rating_overall") or "",
+        "evidence_level": entry.get("_oxford_level_of_evidence_estimate") or "Unrated",
+        "excluded": "Y" if excluded_reason else "N",
+        "excluded_reason": excluded_reason,
+        "changed": "Y" if changed else "N",
+        "changed_from_to": changed_from_to,
+        "retracted_withdrawn": "Y" if RETRACTION_PUBTYPES & set(integrity_flags) else "N",
+        "flagged_for_manual_review": "Y" if review_reasons else "N",
+        "manual_review_reasons": "; ".join(review_reasons),
+        "abstract": entry.get("_abstract") or "",
+        "run_id": run_id,
+        "row_hash": "",
+        "md_cto_signoff_name": "",
+        "md_cto_signoff_date": "",
+    }
+    # SHA-256 fingerprint of the row's contents: if any value is edited after the run, recomputing
+    # the hash will no longer match. Sign-off columns are left out so filling them in doesn't break it
+    hashed = [str(row[c]) for c in AUDIT_CSV_COLUMNS if c not in UNHASHED_COLUMNS]
+    row["row_hash"] = hashlib.sha256(json.dumps(hashed, ensure_ascii=False).encode("utf-8")).hexdigest()
+    return row
+
+
+def write_audit_csv(entries, csv_path, run_id, has_previous_run):
+    # utf-8-sig so Excel opens accented characters and dashes correctly
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=AUDIT_CSV_COLUMNS)
+        writer.writeheader()
+        for entry in entries:
+            writer.writerow(audit_row(entry, run_id, has_previous_run))
+
+
 def main():
-    # Add command line parsing arguments
+    # Command line parsing arguments
     parser = argparse.ArgumentParser(description="Tier 1 existence check for a references JSON file.")
     parser.add_argument("--input", required=True, help="Path to the references JSON file.")
     parser.add_argument("--output", help="Path to write the annotated JSON (default: <input>.checked.json).")
     parser.add_argument("--email", required=True, help="Contact email, required by NCBI/CrossRef usage policy.")
     parser.add_argument("--cache", default=".existence_cache.json", help="Path to the local cache file.")
     parser.add_argument("--limit", type=int, help="Only process the first N entries (for a quick test run).")
+    # CHANGED: where to write the audit CSV
+    parser.add_argument("--audit-csv", help="Path to write the audit CSV (default: <output>.audit.csv).")
     # Can override the default 28-day cache lifetime without editing the script with the number of days entered
     # e.g., --cache-ttl-days 0 to force a full re-check of everything on demand
     parser.add_argument("--cache-ttl-days", type=int, default=CACHE_TTL_DAYS,
@@ -743,15 +853,15 @@ def main():
     input_path = Path(args.input)
     output_path = Path(args.output) if args.output else input_path.with_suffix(".checked.json")
     cache_path = Path(args.cache)
+    # CHANGED: audit CSV path, and a run id that ties every CSV row to this run (UTC start time)
+    audit_csv_path = Path(args.audit_csv) if args.audit_csv else output_path.with_suffix(".audit.csv")
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
     # Read output of last run (if any) before it is overwritten by this run
     # This way, it can be tagged in phase 5 below with whether its verdict changed since the last monthly check
     previous_verdicts = load_previous_verdicts(output_path)
 
     # Load new input JSON file
-    # Previously a bare open() call, so a nonexistent --input path crashed with a raw
-    # Python traceback (FileNotFoundError, internal line numbers, etc.) instead of a clean error
-    # Now catches that specific case and exits with a short, readable message instead
     try:
         with open(input_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -798,8 +908,7 @@ def main():
     # ========== PHASE 1: Normalize ids (pmid/doi/url), bucket for batch lookups ==========
     print("\n=== PHASE 1: Normalizing IDs ===")
     # In extract_entries when non-dict items are silently dropped from the output, they are
-    # loudly announced here. This is a quirk of the program that NEEDS TO BE DISCUSSED
-    # to decide whether the way it currently runs is sufficient or if a fix is needed
+    # loudly announced here
     if skipped_count:
         print(f"  WARNING: skipped {skipped_count} item(s) in the input that weren't valid citation objects (not a dict) -- they were NOT checked and are NOT included in the counts below.")
     for entry in entries:
@@ -998,6 +1107,9 @@ def main():
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
+    # CHANGED: write the audit CSV (only the entries checked this run, so --limit runs list just those)
+    write_audit_csv(entries, audit_csv_path, run_id, bool(previous_verdicts))
+
     # Collect every entry PubMed tagged with a retraction/correction notice
     # Printed first as this is a major patient safety signal
     integrity_hits = [
@@ -1034,6 +1146,7 @@ def main():
         print("No previous run found at the output path -- this is treated as a first run (no drift to report).")
 
     print(f"Output written to: {output_path}")
+    print(f"Audit CSV written to: {audit_csv_path} (run id {run_id})")  # CHANGED
     print("=" * 50)
 
 
