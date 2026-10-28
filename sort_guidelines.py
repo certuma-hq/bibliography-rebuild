@@ -143,7 +143,7 @@ def confirmed_by_pubmed(entry):
     return any(kw in corp_author for kw in GUIDELINE_ORG_KEYWORDS)
 
 
-def pick_primary_specialty(entry):
+def pick_primary_specialty(entry, duplicates=()):
     # A reference can be associated with more than one CERT-* protocol
     # Among all specialties it is associated with, use the one with the shortest
     # (most conservative) staleness window for determining the primary specialty
@@ -154,17 +154,82 @@ def pick_primary_specialty(entry):
     # silently skipped. This only matters if we care about keeping a record of all processing
     # of protocols though should not affect the overall specialty assignment process because
     # the valid specialty/protocol prefix will still be used for the assignment.
-    prefixes = set()
-    for p in entry.get("cited_by_protocols") or []:
-        if not isinstance(p, str): 
-            continue
-        m = CERT_PREFIX_RE.match(p)
-        if m:
-            prefixes.add(m.group(1))
+    # CHANGED: duplicates = other copies of the same document (same PubMed ID/DOI); their
+    # protocols count too, so one document gets one specialty and the strictest limit applies
+    prefixes = specialty_prefixes(entry)
+    for copy in duplicates:
+        prefixes |= specialty_prefixes(copy)
     if not prefixes:
         return None
    # Return the specialty with the shortest staleness window, breaking ties alphabetically
     return min(prefixes, key=lambda p: (SPECIALTY_STALENESS_YEARS.get(p, DEFAULT_STALENESS_YEARS), p))
+
+
+def specialty_prefixes(entry):
+    # CHANGED: split out of pick_primary_specialty so a duplicate group's protocols can be pooled
+    prefixes = set()
+    for p in entry.get("cited_by_protocols") or []:
+        if not isinstance(p, str):
+            continue
+        m = CERT_PREFIX_RE.match(p)
+        if m:
+            prefixes.add(m.group(1))
+    return prefixes
+
+
+def group_duplicates(candidates):
+    # CHANGED: finds the same document stored under several ids. Entries that share a PubMed ID
+    # or DOI are grouped (chains included: A shares a PMID with B, B shares a DOI with C).
+    # Safeguard: a group only counts as duplicates if the titles agree (same_document). If they
+    # don't, two different documents share an identifier, so one has the wrong identifier
+    # attached (e.g. the Tokyo Guidelines cholangitis and cholecystitis papers under one PMID).
+    # Returns (duplicate_groups, identifier_conflicts), each a list of member lists
+    n = len(candidates)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    first_seen = {}
+    for i, e in enumerate(candidates):
+        for key in (("pmid", e.get("_pmid")), ("doi", e.get("_doi"))):
+            if not key[1]:
+                continue
+            if key in first_seen:
+                union(i, first_seen[key])
+            else:
+                first_seen[key] = i
+
+    groups = defaultdict(list)
+    for i in range(n):
+        groups[find(i)].append(candidates[i])
+
+    duplicate_groups, identifier_conflicts = [], []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        if len(cluster_by_title(members, same=same_document)) == 1:
+            duplicate_groups.append(members)
+        else:
+            identifier_conflicts.append(members)
+    return duplicate_groups, identifier_conflicts
+
+
+def pick_representative(members):
+    # CHANGED: the copy that stands for a duplicate group through the sorting steps. Prefers a
+    # PubMed-confirmed copy, then the one cited by the most protocols, then alphabetical by id
+    # so the choice is the same every run. The decision made for it applies to every copy
+    return min(members, key=lambda e: (not confirmed_by_pubmed(e),
+                                       -len([p for p in e.get("cited_by_protocols") or [] if isinstance(p, str)]),
+                                       e.get("id") or ""))
 
 
 # Decides whether two guideline titles are editions of the same guideline
@@ -181,9 +246,23 @@ def same_guideline(title_a, title_b):
     return len(differing_words) <= 1
 
 
-def cluster_by_title(entries):
-    # Union-find over pairwise titles_match() calls, so A-similar-to-B-similar-to-C
+def same_document(title_a, title_b):
+    # CHANGED: decides whether two entries that share a PubMed ID/DOI really are the same
+    # document. Formatting differences are fine: one title may be a truncation or expansion of
+    # the other (a dropped subtitle, or "A Report of the ... Committee" added). A substitution is
+    # not: if each title has a meaningful word the other lacks (cholangitis vs cholecystitis),
+    # they're different papers sharing an identifier
+    if not titles_match(title_a, title_b):
+        return False
+    words_a, words_b = title_keywords(title_a), title_keywords(title_b)
+    return words_a <= words_b or words_b <= words_a
+
+
+def cluster_by_title(entries, same=same_guideline):
+    # Union-find over pairwise title comparisons, so A-similar-to-B-similar-to-C
     # all land in one cluster even if A and C alone aren't similar enough.
+    # CHANGED: `same` is the comparison to use: same_guideline (editions of one guideline,
+    # the default) or same_document (copies of one document, for duplicate groups)
     n = len(entries)
     parent = list(range(n))
 
@@ -207,7 +286,7 @@ def cluster_by_title(entries):
     # some pairs are not directly similar
     for i in range(n):
         for j in range(i + 1, n):
-            if same_guideline(entries[i].get("title") or "", entries[j].get("title") or ""):  
+            if same(entries[i].get("title") or "", entries[j].get("title") or ""):
                 union(i, j)
 
     # Iterate through all guidelines
@@ -395,23 +474,45 @@ def main():
     guideline_candidates = [e for e in entries if is_guideline_reference(e) and not e.get("_pubmed_integrity_flags")]
     # CHANGED: removed the non-guideline pool that fed the fallback suggestions
 
+    # ---- Step 2 (CHANGED): the same document under several ids ----
+    # Each duplicate group is decided once, through one representative copy; the decision then
+    # applies to every copy (all ids uploaded if approved, one review row otherwise).
+    # Identifier conflicts (same PubMed ID/DOI, different titles) are held for review as a whole
+    duplicate_groups, identifier_conflicts = group_duplicates(guideline_candidates)
+    copies_of = {}  # representative (by object identity) -> its other copies
+    handled_elsewhere = set()
+    for members in duplicate_groups:
+        rep = pick_representative(members)
+        copies_of[id(rep)] = [m for m in members if m is not rep]
+        handled_elsewhere.update(id(m) for m in members if m is not rep)
+    handled_elsewhere.update(id(m) for members in identifier_conflicts for m in members)
+
+    def copies(entry):
+        return copies_of.get(id(entry), [])
+
+    def also_cited_as(entry):
+        return "; ".join(sorted(m.get("id") or "" for m in copies(entry)))
+
     # ---- Step 3: group guideline candidates by specialty ----
     by_specialty = defaultdict(list)
     unspecified = []
     label_conflicts = []  # CHANGED: labeled guideline but PubMed says randomized trial
     for e in guideline_candidates:
+        if id(e) in handled_elsewhere:  # CHANGED: follows its representative, or held as a conflict
+            continue
         # CHANGED: kept out of the guideline families, so a trial can't be picked as a
         # family's newest edition or approved; reviewed separately below
         if label_conflicts_with_pubmed(e):
             label_conflicts.append(e)
             continue
-        specialty = pick_primary_specialty(e)
+        specialty = pick_primary_specialty(e, copies(e))
         if specialty is None:
             unspecified.append(e)
         else:
             by_specialty[specialty].append(e)
 
     approved = []
+    approved_documents = 0  # CHANGED: documents approved; approved holds every id (copies included)
     label_only_count = 0  # Current guidelines sent to review because only the type label says guideline
     review_rows = list(fda_review_rows)
     specialties_with_no_guideline = []
@@ -446,10 +547,11 @@ def main():
             # since max() above prefers editions with one
             if not newest.get("year"):
                 review_rows.append({
-                    "id": newest.get("id"), "title": newest.get("title"), "year": "",
+                    "id": newest.get("id"), "also_cited_as": also_cited_as(newest),
+                    "title": newest.get("title"), "year": "",
                     "specialty": specialty, "evidence_level": "",
                     "reason": "guideline_no_year: no year recorded, check how current this is",
-                    "decision": "",  # CHANGED: suggestion columns removed
+                    "decision": "",
                 })
                 continue
 
@@ -459,22 +561,27 @@ def main():
             # a guideline. If only the bibliography's type label says so, it goes to review instead
             if age <= threshold and not confirmed_by_pubmed(newest):
                 review_rows.append({
-                    "id": newest.get("id"), "title": newest.get("title"), "year": newest.get("year"),
+                    "id": newest.get("id"), "also_cited_as": also_cited_as(newest),
+                    "title": newest.get("title"), "year": newest.get("year"),
                     "specialty": specialty, "evidence_level": newest.get("_oxford_level_of_evidence_estimate"),
                     "reason": "guideline_label_only: labeled guideline in bibliography only, confirm",
-                    "decision": "",  # CHANGED: suggestion columns removed
+                    "decision": "",
                 })
                 label_only_count += 1
             elif age <= threshold:
                 # ---- Step 6: approved ----
+                # CHANGED: every copy's id is uploaded, since protocols cite references by id
                 approved.append(newest)
+                approved.extend(copies(newest))
+                approved_documents += 1
             else:
                 # ---- Step 7: aged out ----
                 # CHANGED: one review row for the out-of-date guideline itself, instead of rows
                 # suggesting non-guideline studies. The reviewer keeps it (still the latest
                 # edition), replaces it (newer guideline added to the bibliography), or rejects it
                 review_rows.append({
-                    "id": newest.get("id"), "title": newest.get("title"), "year": newest.get("year"),
+                    "id": newest.get("id"), "also_cited_as": also_cited_as(newest),
+                    "title": newest.get("title"), "year": newest.get("year"),
                     "specialty": specialty, "evidence_level": newest.get("_oxford_level_of_evidence_estimate"),
                     "reason": f"guideline_aged_out: {age} years old (limit {threshold}), keep if still the latest edition",
                     "decision": "",
@@ -484,22 +591,41 @@ def main():
     # never approved; one review row each so the reviewer can check for a wrong attached document
     for e in label_conflicts:
         review_rows.append({
-            "id": e.get("id"), "title": e.get("title"), "year": e.get("year"),
-            "specialty": pick_primary_specialty(e) or "UNSPECIFIED",
+            "id": e.get("id"), "also_cited_as": also_cited_as(e),
+            "title": e.get("title"), "year": e.get("year"),
+            "specialty": pick_primary_specialty(e, copies(e)) or "UNSPECIFIED",
             "evidence_level": e.get("_oxford_level_of_evidence_estimate"),
             "reason": ("guideline_label_conflict: bibliography says guideline but PubMed says "
                        "randomized trial; check whether the wrong document is attached"),
             "decision": "",
         })
 
+    # CHANGED: identifier conflicts -- entries that share a PubMed ID/DOI but have different
+    # titles. One of them has the wrong identifier attached, so none is approved and every
+    # member gets a review row until the identifier is fixed in the bibliography
+    for members in identifier_conflicts:
+        member_ids = sorted(m.get("id") or "" for m in members)
+        for m in members:
+            others = "; ".join(i for i in member_ids if i != m.get("id"))
+            review_rows.append({
+                "id": m.get("id"), "also_cited_as": "",
+                "title": m.get("title"), "year": m.get("year"),
+                "specialty": pick_primary_specialty(m) or "UNSPECIFIED",
+                "evidence_level": m.get("_oxford_level_of_evidence_estimate"),
+                "reason": (f"identifier_conflict: shares a PubMed ID/DOI with {others} but the titles "
+                           "differ; one has the wrong identifier attached"),
+                "decision": "",
+            })
+
     # Entries with no identifiable specialty at all -- can't apply a specialty-specific
     # currency rule, so route straight to manual review rather than guessing.
     for e in unspecified:
         review_rows.append({
-            "id": e.get("id"), "title": e.get("title"), "year": e.get("year"),
+            "id": e.get("id"), "also_cited_as": also_cited_as(e),
+            "title": e.get("title"), "year": e.get("year"),
             "specialty": "UNSPECIFIED", "evidence_level": e.get("_oxford_level_of_evidence_estimate"),
             "reason": "no_specialty_identified",
-            "decision": "",  # CHANGED: suggestion columns removed
+            "decision": "",
         })
 
     # ---- Write clean, upload-ready output ----
@@ -513,8 +639,9 @@ def main():
 
     # ---- Write manual-review spreadsheet ----
     with open(args.review_output, "w", encoding="utf-8", newline="") as f:
-        # CHANGED: removed the evidence_tier and title_relevance_score columns (suggestions only)
-        writer = csv.DictWriter(f, fieldnames=["id", "title", "year", "specialty", "evidence_level", "reason", "decision", "category"])
+        # CHANGED: also_cited_as lists the other ids of the same document, so one decision
+        # covers all of them. Rows without the key (FDA, empty specialty) get a blank
+        writer = csv.DictWriter(f, fieldnames=["id", "also_cited_as", "title", "year", "specialty", "evidence_level", "reason", "decision", "category"])
         writer.writeheader()
         writer.writerows(review_rows)
 
@@ -527,7 +654,11 @@ def main():
     print("SUMMARY")
     print("=" * 50)
     print(f"Guideline candidates evaluated: {len(guideline_candidates)}")
-    print(f"Approved (current): {len(approved)}")
+    print(f"Approved (current): {approved_documents} documents, {len(approved)} ids (every id of an approved document is uploaded)")  # CHANGED
+    extra_ids = sum(len(members) - 1 for members in duplicate_groups)
+    print(f"Same document under several ids: {len(duplicate_groups)} groups decided once ({extra_ids} extra ids)")  # CHANGED
+    conflict_ids = sum(len(members) for members in identifier_conflicts)
+    print(f"Identifier conflicts (same PubMed ID/DOI, different titles; sent to review): {len(identifier_conflicts)} groups, {conflict_ids} ids")  # CHANGED
     print(f"Current but labeled guideline in bibliography only (sent to review): {label_only_count}")
     print(f"Labeled guideline but PubMed says randomized trial (sent to review): {len(label_conflicts)}")  # CHANGED
     print(f"Specialties with zero guideline coverage: {len(specialties_with_no_guideline)}")
