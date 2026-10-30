@@ -40,6 +40,12 @@ GUIDELINE_ORG_KEYWORDS = {
 # bibliography "type" values that count as a guideline
 GUIDELINE_TYPE_LABELS = {"guideline", "clinical-guideline"}
 
+# CHANGED (P1): columns of the manual-review spreadsheet (Sheet B). Script 2 fills the left
+# block; the reviewer fills the right block (REVIEWER_COLUMNS), which script 2 writes blank
+# and never reads. Script 3 reads the reviewer block back to apply the decisions
+REVIEWER_COLUMNS = ["decision", "replacement_id_or_doi", "reviewer", "review_date", "notes"]
+REVIEW_COLUMNS = ["id", "also_cited_as", "title", "year", "specialty", "evidence_level", "reason", "category"] + REVIEWER_COLUMNS
+
 # CHANGED: removed the fallback evidence cascade (EVIDENCE_CASCADE_TIERS) that suggested
 # non-guideline studies as replacements for out-of-date guidelines. Suggestions were rarely
 # on topic, and only guidelines and FDA documents are wanted in the output
@@ -460,7 +466,7 @@ def main():
             fda_review_rows.append({
                 "id": e.get("id"), "title": e.get("title"), "year": e.get("year"),
                 "specialty": "", "evidence_level": "",
-                "reason": reason, "decision": "",  # CHANGED: suggestion columns removed
+                "reason": reason,  # CHANGED: suggestion columns removed
                 "category": category,
             })
 
@@ -533,7 +539,6 @@ def main():
             review_rows.append({
                 "id": "", "title": "", "year": "", "specialty": specialty, "evidence_level": "",
                 "reason": "no_guideline_for_specialty: find a guideline, or confirm none is needed",
-                "decision": "",
             })
             continue
 
@@ -551,7 +556,6 @@ def main():
                     "title": newest.get("title"), "year": "",
                     "specialty": specialty, "evidence_level": "",
                     "reason": "guideline_no_year: no year recorded, check how current this is",
-                    "decision": "",
                 })
                 continue
 
@@ -565,7 +569,6 @@ def main():
                     "title": newest.get("title"), "year": newest.get("year"),
                     "specialty": specialty, "evidence_level": newest.get("_oxford_level_of_evidence_estimate"),
                     "reason": "guideline_label_only: labeled guideline in bibliography only, confirm",
-                    "decision": "",
                 })
                 label_only_count += 1
             elif age <= threshold:
@@ -584,7 +587,6 @@ def main():
                     "title": newest.get("title"), "year": newest.get("year"),
                     "specialty": specialty, "evidence_level": newest.get("_oxford_level_of_evidence_estimate"),
                     "reason": f"guideline_aged_out: {age} years old (limit {threshold}), keep if still the latest edition",
-                    "decision": "",
                 })
 
     # CHANGED: labeled guideline in the bibliography but PubMed says randomized trial --
@@ -597,7 +599,6 @@ def main():
             "evidence_level": e.get("_oxford_level_of_evidence_estimate"),
             "reason": ("guideline_label_conflict: bibliography says guideline but PubMed says "
                        "randomized trial; check whether the wrong document is attached"),
-            "decision": "",
         })
 
     # CHANGED: identifier conflicts -- entries that share a PubMed ID/DOI but have different
@@ -614,7 +615,6 @@ def main():
                 "evidence_level": m.get("_oxford_level_of_evidence_estimate"),
                 "reason": (f"identifier_conflict: shares a PubMed ID/DOI with {others} but the titles "
                            "differ; one has the wrong identifier attached"),
-                "decision": "",
             })
 
     # Entries with no identifiable specialty at all -- can't apply a specialty-specific
@@ -625,7 +625,6 @@ def main():
             "title": e.get("title"), "year": e.get("year"),
             "specialty": "UNSPECIFIED", "evidence_level": e.get("_oxford_level_of_evidence_estimate"),
             "reason": "no_specialty_identified",
-            "decision": "",
         })
 
     # ---- Write clean, upload-ready output ----
@@ -641,7 +640,10 @@ def main():
     with open(args.review_output, "w", encoding="utf-8", newline="") as f:
         # CHANGED: also_cited_as lists the other ids of the same document, so one decision
         # covers all of them. Rows without the key (FDA, empty specialty) get a blank
-        writer = csv.DictWriter(f, fieldnames=["id", "also_cited_as", "title", "year", "specialty", "evidence_level", "reason", "decision", "category"])
+        # CHANGED (P1): the reviewer columns (decision, replacement_id_or_doi, reviewer,
+        # review_date, notes) sit at the right, written blank on every row for the reviewer to
+        # fill; restval blanks them and any other column a row doesn't carry
+        writer = csv.DictWriter(f, fieldnames=REVIEW_COLUMNS, restval="")
         writer.writeheader()
         writer.writerows(review_rows)
 
